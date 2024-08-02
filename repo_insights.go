@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/go-github/v63/github"
@@ -22,6 +23,9 @@ type RepoInsights struct {
 
 func NewRepoInsights(repoName string, dateRange string) (*RepoInsights, error) {
 	ghClient := github.NewClient(nil)
+	if os.Getenv("GITHUB_PAT") != "" {
+		ghClient = ghClient.WithAuthToken(os.Getenv("GITHUB_PAT"))
+	}
 
 	cache, err := NewJSONCache("cache", time.Hour*24)
 	if err != nil {
@@ -57,6 +61,14 @@ func (r *RepoInsights) SearchIssues(ctx context.Context, query string, since str
 	for {
 		result, resp, err := r.ghClient.Search.Issues(ctx, fullQuery, searchOpts)
 
+		if _, ok := err.(*github.RateLimitError); ok {
+			log.Err(err).Msg("Rate limited, waiting for a minute...")
+			time.Sleep(time.Minute)
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+
 		if err != nil {
 			return nil, err
 		}
@@ -77,6 +89,27 @@ func (r *RepoInsights) SearchIssues(ctx context.Context, query string, since str
 	}
 
 	return issues, nil
+}
+
+func (r *RepoInsights) FilterOut(issues []*github.Issue, filter []string) []*github.Issue {
+	filtered := []*github.Issue{}
+
+	for _, issue := range issues {
+		title := strings.ToLower(issue.GetTitle())
+		found := false
+		for _, f := range filter {
+			if strings.HasPrefix(title, fmt.Sprintf("%s:", f)) ||
+				strings.HasPrefix(title, fmt.Sprintf("%ss:", f)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			filtered = append(filtered, issue)
+		}
+	}
+
+	return filtered
 }
 
 func (r *RepoInsights) PrintWeekly(issues []*github.Issue) {
@@ -119,8 +152,28 @@ func (r *RepoInsights) PrintWeekly(issues []*github.Issue) {
 }
 
 // PrintMonthly prints the number of issues created each month
-func (r *RepoInsights) PrintMonthly(issues []*github.Issue) {
+func (r *RepoInsights) PrintMonthly(since string, issues []*github.Issue, printTitles bool) error {
+	// Initialize the monthMap (to make sure all months have a value)
 	monthMap := make(map[string][]*github.Issue)
+	sinceDate, err := time.Parse(time.DateOnly, since)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for i := sinceDate.Year(); i <= now.Year(); i++ {
+		firstMonth := time.January
+		lastMonth := time.December
+		if i == now.Year() {
+			firstMonth = sinceDate.Month()
+			lastMonth = now.Month()
+		}
+		for i := sinceDate.Year(); i <= now.Year(); i++ {
+			for j := firstMonth; j <= lastMonth; j++ {
+				key := fmt.Sprintf("%d-%02d", i, j)
+				monthMap[key] = []*github.Issue{}
+			}
+		}
+	}
 
 	// Populate the monthMap with issues
 	for _, issue := range issues {
@@ -128,10 +181,14 @@ func (r *RepoInsights) PrintMonthly(issues []*github.Issue) {
 		year, month, _ := created.Date()
 		key := fmt.Sprintf("%d-%02d", year, month)
 
-		if _, ok := monthMap[key]; !ok {
-			monthMap[key] = []*github.Issue{}
-		}
+		// all month already exist
+		// if _, ok := monthMap[key]; !ok {
+		// 	monthMap[key] = []*github.Issue{}
+		// }
 
+		if printTitles {
+			fmt.Println(key, "--", issue.GetTitle())
+		}
 		monthMap[key] = append(monthMap[key], issue)
 	}
 
@@ -147,7 +204,7 @@ func (r *RepoInsights) PrintMonthly(issues []*github.Issue) {
 	for _, key := range keys {
 		numIssues := len(monthMap[key])
 		row = append(row, fmt.Sprintf("%d", numIssues))
-		fmt.Printf("Month %s: %d issues created\n", key, numIssues)
+		// fmt.Printf("Month %s: %d issues created\n", key, numIssues)
 	}
 
 	fmt.Println("--- CSV:")
@@ -156,43 +213,6 @@ func (r *RepoInsights) PrintMonthly(issues []*github.Issue) {
 	_ = cw.Write(row)
 	cw.Flush()
 	fmt.Println("---")
-}
 
-func (r *RepoInsights) Print(issues []*github.Issue) {
-	weekMap := make(map[string][]*github.Issue)
-
-	// Populate the weekMap with issues
-	for _, issue := range issues {
-		created := issue.GetCreatedAt()
-		year, week := created.ISOWeek()
-		key := fmt.Sprintf("%d-%02d", year, week)
-
-		if _, ok := weekMap[key]; !ok {
-			weekMap[key] = []*github.Issue{}
-		}
-
-		weekMap[key] = append(weekMap[key], issue)
-	}
-
-	// Print the number of issue created each week
-	keys := make([]string, 0, len(weekMap))
-	for key := range weekMap {
-		keys = append(keys, key)
-	}
-
-	sort.Strings(keys)
-
-	row := []string{}
-	for _, key := range keys {
-		numIssues := len(weekMap[key])
-		row = append(row, fmt.Sprintf("%d", numIssues))
-		fmt.Printf("Week %s: %d issues created\n", key, numIssues)
-	}
-
-	fmt.Println("--- CSV:")
-	cw := csv.NewWriter(os.Stdout)
-	_ = cw.Write(keys)
-	_ = cw.Write(row)
-	cw.Flush()
-	fmt.Println("---")
+	return nil
 }
